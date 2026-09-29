@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Personal Trakt/Nuvio data
+trakt-export*.zip
+*preview*.json
+*nuvio*backup*.json
+*nuvio*report*.json
