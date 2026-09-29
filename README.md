@@ -1,3 +1,6 @@
+> [!WARNING]
+> This project is fully vibecoded, probably inefficient, but it does what I wanted lol
+
 # Trakt Lists → Nuvio Library
 
 A dependency-free Python tool that imports **personal/custom Trakt lists from a Trakt account export ZIP into your Nuvio library**.
