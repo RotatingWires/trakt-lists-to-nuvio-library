@@ -330,20 +330,6 @@ This project handles account credentials and personal media-library data, so tre
 - **Keep your backup until verification is complete.** A network/API/service change can always cause unexpected behavior.
 - **Review dry-run results after upstream changes.** Nuvio and Cinemeta are external services; API formats or behavior may change over time.
 
-## `.gitignore`
-
-The repository ignores common sensitive/local files including:
-
-```text
-.env
-trakt-export*.zip
-*preview*.json
-*nuvio*backup*.json
-*nuvio*report*.json
-```
-
-Still check `git status` before every commit if you keep personal exports or generated library files inside the repository directory.
-
 ## Example first-time workflow
 
 ```bash
