@@ -473,6 +473,10 @@ python -m py_compile trakt_lists_to_nuvio.py
 
 This project handles credentials and personal viewing data.
 
+The repository itself is intended to contain **source code and documentation only**. It does not need, and should never contain, a real Trakt export, Nuvio backup/report, account email, local username/path, access token, password, or personal watch-history fixture. Test media records use synthetic IDs/titles.
+
+The built-in Nuvio `sb_publishable_...` value is Nuvio's public/publishable client configuration, not a user credential. It is intentionally safe to appear in client-side source; personal session/access tokens are not.
+
 - Do not commit Trakt export ZIPs.
 - Do not commit preview/backup/report JSON files.
 - Do not hard-code a Nuvio password or access token.

@@ -2,10 +2,22 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
-.env
 
-# Personal Trakt/Nuvio data
+# Local secrets / environment
+.env
+.env.*
+!.env.example
+*.log
+
+# Personal Trakt/Nuvio exports and generated data
 trakt-export*.zip
+*trakt*export*.zip
 *preview*.json
-*nuvio*backup*.json
-*nuvio*report*.json
+*backup*.json
+*report*.json
+nuvio-*.json
+trakt-to-nuvio-*.json
+
+# Common OS/editor debris
+.DS_Store
+Thumbs.db
