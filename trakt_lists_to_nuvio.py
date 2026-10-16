@@ -673,6 +673,47 @@ def progress_item_key(item: dict[str, Any]) -> str:
     return cid
 
 
+def progress_identity_key(item: dict[str, Any]) -> str:
+    """Logical progress identity used by Nuvio when reconciling legacy/opaque keys."""
+    cid = str(item.get("content_id") or "").strip()
+    season = item.get("season")
+    episode = item.get("episode")
+    return f"{cid}|{season if season is not None else ''}|{episode if episode is not None else ''}"
+
+
+def reseed_progress_after_clear(items: list[dict[str, Any]], floor_ms: int | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Move imported progress timestamps past Nuvio's delete tombstones.
+
+    Hosted Nuvio intentionally rejects a progress upsert when a newer delete event exists
+    for the same progress key. A destructive replace creates exactly such tombstones, so
+    replaying an older Trakt paused_at timestamp would be silently ignored. Re-seeding the
+    sync timestamp after the clear preserves position/duration and relative ordering while
+    allowing the intended one-time rebuild. The original Trakt timestamps are retained in
+    the local report.
+    """
+    if not items:
+        return [], []
+    base = max(int(time.time() * 1000) + 2_000, int(floor_ms or 0))
+    ordered = sorted(enumerate(items), key=lambda pair: (int(pair[1].get("last_watched") or 0), pair[0]))
+    rewritten: list[dict[str, Any] | None] = [None] * len(items)
+    audit: list[dict[str, Any]] = []
+    for rank, (index, raw) in enumerate(ordered):
+        item = dict(raw)
+        original = int(item.get("last_watched") or 0)
+        reseeded = base + rank
+        item["last_watched"] = reseeded
+        rewritten[index] = item
+        audit.append({
+            "progress_key": progress_item_key(item),
+            "content_id": item.get("content_id"),
+            "season": item.get("season"),
+            "episode": item.get("episode"),
+            "original_last_watched": original,
+            "reseeded_last_watched": reseeded,
+        })
+    return [x for x in rewritten if x is not None], audit
+
+
 def _strip_private(item: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in item.items() if not str(k).startswith("_")}
 
@@ -1108,26 +1149,46 @@ def replace_tracking_from_plan(
 
     print("Tracking clear verified. Rebuilding from Trakt…")
     watched_clean = [_strip_private(x) for x in plan.watched_items]
-    progress_clean = [_strip_private(x) for x in plan.progress_items]
+    progress_original = [_strip_private(x) for x in plan.progress_items]
+    # Hosted Nuvio records progress-delete tombstones. Replaying the old Trakt
+    # paused_at timestamp after this clear is intentionally rejected as a stale
+    # resurrection, so use a fresh sync timestamp while preserving positions,
+    # durations, keys, and the original timestamps in the report.
+    progress_clean, progress_timestamp_reseed = reseed_progress_after_clear(progress_original)
     for batch in _chunk(watched_clean, 300):
         api.push_watched(profile_id, batch, origin)
     for batch in _chunk(progress_clean, 200):
         api.push_progress(profile_id, batch, origin)
 
     expected_watched = {watched_item_key(x) for x in watched_clean}
-    expected_progress = {progress_item_key(x) for x in progress_clean}
+    expected_progress_by_identity = {progress_identity_key(x): x for x in progress_clean}
     watched_after: list[dict[str, Any]] = []
     progress_after: list[dict[str, Any]] = []
     missing_watched: set[str] = set()
     missing_progress: set[str] = set()
+    remapped_progress_keys: list[dict[str, Any]] = []
     for delay in (0.5, 1.2, 2.5, 5.0):
         time.sleep(delay)
         watched_after = api.pull_watched(profile_id)
-        progress_after = api.pull_progress(profile_id, limit=max(10_000, len(expected_progress) + 500))
+        progress_after = api.pull_progress(profile_id, limit=max(10_000, len(expected_progress_by_identity) + 500))
         actual_watched = {watched_item_key(x) for x in watched_after}
-        actual_progress = {progress_item_key(x) for x in progress_after}
+        actual_progress_by_identity = {progress_identity_key(x): x for x in progress_after}
         missing_watched = expected_watched - actual_watched
-        missing_progress = expected_progress - actual_progress
+        missing_identities = set(expected_progress_by_identity) - set(actual_progress_by_identity)
+        missing_progress = {progress_item_key(expected_progress_by_identity[x]) for x in missing_identities}
+        remapped_progress_keys = []
+        for identity, expected in expected_progress_by_identity.items():
+            actual = actual_progress_by_identity.get(identity)
+            if actual is None:
+                continue
+            expected_key = progress_item_key(expected)
+            actual_key = progress_item_key(actual)
+            if expected_key != actual_key:
+                remapped_progress_keys.append({
+                    "identity": identity,
+                    "expected_progress_key": expected_key,
+                    "actual_progress_key": actual_key,
+                })
         if not missing_watched and not missing_progress:
             break
 
@@ -1145,9 +1206,11 @@ def replace_tracking_from_plan(
         "watched_after": len(watched_after),
         "missing_watched_keys": sorted(missing_watched),
         "progress_before": len(progress_before),
-        "progress_expected": len(expected_progress),
+        "progress_expected": len(expected_progress_by_identity),
         "progress_after": len(progress_after),
         "missing_progress_keys": sorted(missing_progress),
+        "progress_key_remaps": remapped_progress_keys,
+        "progress_timestamp_reseed": progress_timestamp_reseed,
         "library_before": len(library_before),
         "library_after": len(library_after),
         "library_key_set_changed": library_changed,
@@ -1163,7 +1226,12 @@ def replace_tracking_from_plan(
             "The script never called the Library write endpoint during history replacement, so do not auto-restore; "
             f"inspect concurrent device changes and the backup at {backup_path}."
         )
-    print(f"Verified {len(expected_watched)} watched states and {len(expected_progress)} Continue Watching item(s).")
+    if progress_timestamp_reseed:
+        print(
+            f"Re-seeded {len(progress_timestamp_reseed)} Continue Watching sync timestamp(s) after the destructive clear "
+            "so Nuvio's anti-resurrection tombstones would accept the rebuild."
+        )
+    print(f"Verified {len(expected_watched)} watched states and {len(expected_progress_by_identity)} Continue Watching item(s).")
     print(f"Verified Library membership stayed unchanged at {len(library_after)} item(s).")
     return backup_path, report
 

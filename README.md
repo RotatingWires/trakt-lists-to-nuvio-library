@@ -164,6 +164,21 @@ When `--replace-history` or `--history-only` is used, it intentionally:
 
 Because the old tracking state is cleared first, rerunning the repair does not stack duplicate watched rows.
 
+### Continue Watching delete tombstones
+
+Hosted Nuvio records a delete event when a Continue Watching row is removed. Its sync API then deliberately rejects an older progress update for the same item so a stale device cannot resurrect progress that was intentionally deleted.
+
+That means a naive "delete all progress, then replay the original historical Trakt `paused_at` timestamps" fails: the fresh delete event is newer than the Trakt timestamp, so Nuvio silently ignores the replay.
+
+During a destructive history replacement this importer now:
+
+1. preserves the original Trakt playback timestamp in the local import report;
+2. clears and verifies the old Continue Watching rows;
+3. re-seeds only the Nuvio **sync timestamp** just after the clear, preserving the exact position, duration, content ID, season/episode, and relative recency ordering;
+4. verifies progress by logical content identity as well as the server progress key, matching Nuvio's own compatibility behavior for legacy/opaque progress keys.
+
+This timestamp re-seed is only for Continue Watching rows during the destructive rebuild. Watched-history timestamps are not changed.
+
 ## The `watched-movies.json` bug that this fixes
 
 Some Trakt exports use:

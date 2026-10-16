@@ -196,6 +196,112 @@ class TrackingReplacementTests(unittest.TestCase):
         self.assertFalse(report["library_key_set_changed"])
         self.assertEqual(api.library, library)
 
+    def test_progress_reseed_survives_delete_tombstone_and_opaque_server_key(self):
+        library = [{"content_id": "tt9999999", "content_type": "movie", "name": "Keep Me"}]
+        progress_new = [{
+            "content_id": "tt5555555",
+            "content_type": "movie",
+            "video_id": "tt5555555",
+            "season": None,
+            "episode": None,
+            "position": 500,
+            "duration": 1000,
+            "last_watched": 123,
+            "progress_key": "tt5555555",
+        }]
+
+        class FakeAPI:
+            def __init__(self):
+                self.library = list(library)
+                self.watched = []
+                self.progress = [{
+                    "content_id": "tt4444444",
+                    "content_type": "movie",
+                    "video_id": "tt4444444",
+                    "season": None,
+                    "episode": None,
+                    "position": 100,
+                    "duration": 1000,
+                    "last_watched": 50,
+                    "progress_key": "tt4444444",
+                }]
+                self.progress_delete_tombstone_ms = 0
+
+            def pull_watched(self, profile_id):
+                return list(self.watched)
+
+            def pull_progress(self, profile_id, limit=10_000):
+                return list(self.progress)
+
+            def pull_library(self, profile_id):
+                return list(self.library)
+
+            def delete_watched(self, profile_id, keys, origin):
+                self.watched = []
+
+            def delete_progress(self, profile_id, keys, origin):
+                self.progress = []
+                self.progress_delete_tombstone_ms = int(mod.time.time() * 1000)
+
+            def push_watched(self, profile_id, items, origin):
+                self.watched.extend(items)
+
+            def push_progress(self, profile_id, items, origin):
+                for raw in items:
+                    # Mirrors hosted Nuvio's stale-resurrection protection:
+                    # an older historical timestamp is ignored after a delete event.
+                    if int(raw["last_watched"]) <= self.progress_delete_tombstone_ms:
+                        continue
+                    stored = dict(raw)
+                    # Also simulate a legacy/opaque server progress key. Verification
+                    # should reconcile by logical content identity, like Nuvio does.
+                    stored["progress_key"] = "opaque/server/key"
+                    self.progress.append(stored)
+
+            def push_library(self, *args, **kwargs):
+                raise AssertionError("history replacement must never write the Library")
+
+        plan = mod.HistoryPlan(
+            watched_items=[],
+            progress_items=progress_new,
+            movie_states=0,
+            episode_states=0,
+            movie_plays=0,
+            episode_plays=0,
+            source_history_rows=0,
+            stats_expected_movies=0,
+            stats_expected_episodes=0,
+            resolved_parent_ids=0,
+            unresolved_fallback_ids=[],
+            unresolved_progress=[],
+            warnings=[],
+        )
+        api = FakeAPI()
+        original_sleep = mod.time.sleep
+        mod.time.sleep = lambda _: None
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                _, report = mod.replace_tracking_from_plan(
+                    api=api,
+                    profile_id=1,
+                    plan=plan,
+                    library_before=library,
+                    backup_dir=Path(td),
+                    stamp="test",
+                    yes=True,
+                )
+        finally:
+            mod.time.sleep = original_sleep
+
+        self.assertEqual(len(api.progress), 1)
+        self.assertGreater(api.progress[0]["last_watched"], 123)
+        self.assertEqual(report["missing_progress_keys"], [])
+        self.assertEqual(len(report["progress_key_remaps"]), 1)
+        self.assertEqual(len(report["progress_timestamp_reseed"]), 1)
+        self.assertFalse(report["library_key_set_changed"])
+        self.assertEqual(api.library, library)
+
+
 
 if __name__ == "__main__":
     unittest.main()
