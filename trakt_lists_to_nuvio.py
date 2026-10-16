@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Import personal Trakt list entries from a Trakt export ZIP into a Nuvio library.
+"""Import a Trakt export into Nuvio without sacrificing the existing Library.
 
-This tool reads the current Nuvio library, enriches Trakt-export rows with
-Cinemeta artwork/details, merges non-destructively, then writes the merged library.
-Existing Nuvio values are preserved unless they are blank or were stamped by v1.
+Features:
+- Non-destructive personal-list -> Nuvio Library merge (with Cinemeta metadata enrichment).
+- Optional watched-history replacement: backs up Nuvio tracking, deletes ONLY watched
+  status + Continue Watching, verifies those tracking tables are empty, then rebuilds
+  them from Trakt and verifies the Nuvio Library membership did not change.
+- Supports both watched-movies.json (current Trakt export name) and older numbered names.
+- Validates parsed watched counts against user-stats.json before any destructive operation.
 
 No third-party Python packages are required.
 """
@@ -16,6 +20,8 @@ import json
 import os
 import re
 import sys
+import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -592,6 +598,575 @@ def enrich_items(items: list[dict[str, Any]], bases: list[str], workers: int = 8
     final = sorted(by_id.values(), key=lambda x: int(x.get("added_at") or 0), reverse=True)
     return EnrichmentResult(final, enriched, resolved, failed)
 
+@dataclass
+class HistoryPlan:
+    watched_items: list[dict[str, Any]]
+    progress_items: list[dict[str, Any]]
+    movie_states: int
+    episode_states: int
+    movie_plays: int
+    episode_plays: int
+    source_history_rows: int
+    stats_expected_movies: int | None
+    stats_expected_episodes: int | None
+    resolved_parent_ids: int
+    unresolved_fallback_ids: list[dict[str, Any]]
+    unresolved_progress: list[dict[str, Any]]
+    warnings: list[str]
+
+
+def _zip_json_files(zip_path: Path) -> dict[str, Any]:
+    if not zip_path.exists():
+        raise ToolError(f"Trakt export ZIP not found: {zip_path}")
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise ToolError(f"Cannot open Trakt export ZIP: {exc}") from exc
+    out: dict[str, Any] = {}
+    with zf:
+        for raw_name in zf.namelist():
+            name = Path(raw_name).name
+            if not name.lower().endswith(".json"):
+                continue
+            try:
+                out[name] = json.load(zf.open(raw_name))
+            except (json.JSONDecodeError, OSError) as exc:
+                raise ToolError(f"Could not parse {raw_name}: {exc}") from exc
+    return out
+
+
+def _json_list(files: dict[str, Any], name: str) -> list[dict[str, Any]]:
+    value = files.get(name)
+    if not isinstance(value, list):
+        return []
+    return [x for x in value if isinstance(x, dict)]
+
+
+def _matching_json_rows(files: dict[str, Any], pattern: str) -> list[dict[str, Any]]:
+    rx = re.compile(pattern, re.I)
+    rows: list[dict[str, Any]] = []
+    for name in sorted(files, key=lambda x: [int(y) if y.isdigit() else y for y in re.split(r"(\d+)", x)]):
+        if rx.fullmatch(name):
+            rows.extend(_json_list(files, name))
+    return rows
+
+
+def _latest(existing: dict[str, Any] | None, candidate: dict[str, Any], field: str) -> dict[str, Any]:
+    if existing is None:
+        return candidate
+    return candidate if int(candidate.get(field) or 0) > int(existing.get(field) or 0) else existing
+
+
+def watched_item_key(item: dict[str, Any]) -> str:
+    return f"{str(item.get('content_id') or '').strip()}|{item.get('season') if item.get('season') is not None else ''}|{item.get('episode') if item.get('episode') is not None else ''}"
+
+
+def progress_item_key(item: dict[str, Any]) -> str:
+    key = str(item.get("progress_key") or "").strip()
+    if key:
+        return key
+    cid = str(item.get("content_id") or "").strip()
+    season = item.get("season")
+    episode = item.get("episode")
+    if season is not None and episode is not None:
+        return f"{cid}_s{season}e{episode}"
+    return cid
+
+
+def _strip_private(item: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in item.items() if not str(k).startswith("_")}
+
+
+def parse_runtime_minutes(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        return number if number > 0 else None
+    if not isinstance(value, str):
+        return None
+    raw = value.strip().lower()
+    if not raw:
+        return None
+    hours_match = re.search(r"(\d+(?:\.\d+)?)\s*h", raw)
+    minutes_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:min|m\b)", raw)
+    hours = float(hours_match.group(1)) if hours_match else 0.0
+    minutes = float(minutes_match.group(1)) if minutes_match else 0.0
+    total = hours * 60.0 + minutes
+    if total > 0:
+        return total
+    numeric = re.sub(r"[^0-9.]", "", raw)
+    try:
+        number = float(numeric)
+    except ValueError:
+        return None
+    return number if number > 0 else None
+
+
+def _runtime_minutes_from_meta(meta: dict[str, Any] | None, season: int | None = None, episode: int | None = None) -> float | None:
+    if not isinstance(meta, dict):
+        return None
+    if season is not None and episode is not None:
+        videos = meta.get("videos")
+        if isinstance(videos, list):
+            for video in videos:
+                if not isinstance(video, dict):
+                    continue
+                try:
+                    s = int(video.get("season"))
+                    e = int(video.get("episode"))
+                except (TypeError, ValueError):
+                    continue
+                if s == season and e == episode:
+                    runtime = parse_runtime_minutes(video.get("runtime"))
+                    if runtime:
+                        return runtime
+    return parse_runtime_minutes(meta.get("runtime"))
+
+
+def _resolve_media_content_id(
+    media: dict[str, Any],
+    content_type: str,
+    bases: list[str],
+    timeout: int,
+    cache: dict[tuple[str, str, str, str], tuple[str | None, dict[str, Any] | None]],
+    need_meta: bool = False,
+) -> tuple[str | None, dict[str, Any] | None, bool]:
+    ids = media.get("ids") if isinstance(media.get("ids"), dict) else {}
+    raw_id = stable_content_id(ids)
+    if not raw_id:
+        return None, None, False
+    imdb = ids.get("imdb")
+    if isinstance(imdb, str) and re.fullmatch(r"tt\d+", imdb.strip()):
+        imdb_id = imdb.strip()
+        return imdb_id, (_cinemeta_meta(content_type, imdb_id, bases, timeout) if need_meta else None), False
+
+    title = str(media.get("title") or "").strip()
+    year = str(media.get("year") or "")
+    cache_key = (content_type, raw_id, title.casefold(), year)
+    if cache_key not in cache:
+        dummy = {
+            "content_id": raw_id,
+            "content_type": content_type,
+            "name": title,
+            "release_info": year or None,
+        }
+        cache[cache_key] = _cinemeta_search(dummy, bases, timeout)
+    resolved_id, meta = cache[cache_key]
+    if resolved_id:
+        return resolved_id, meta, True
+    return raw_id, meta, False
+
+
+def build_history_plan(zip_path: Path, bases: list[str], timeout: int = 15, include_progress: bool = True) -> HistoryPlan:
+    """Map Trakt watched state and Continue Watching into Nuvio's current-state model.
+
+    Trakt can contain multiple play events for the same movie/episode. Nuvio Sync stores
+    one current watched state per movie/episode, so the newest timestamp wins by design.
+    """
+    files = _zip_json_files(zip_path)
+    stats = files.get("user-stats.json") if isinstance(files.get("user-stats.json"), dict) else {}
+    movie_stats = stats.get("movies") if isinstance(stats.get("movies"), dict) else {}
+    episode_stats = stats.get("episodes") if isinstance(stats.get("episodes"), dict) else {}
+    expected_movies = int(movie_stats.get("watched")) if isinstance(movie_stats.get("watched"), int) else None
+    expected_episodes = int(episode_stats.get("watched")) if isinstance(episode_stats.get("watched"), int) else None
+    movie_plays = int(movie_stats.get("plays")) if isinstance(movie_stats.get("plays"), int) else 0
+    episode_plays = int(episode_stats.get("plays")) if isinstance(episode_stats.get("plays"), int) else 0
+
+    # IMPORTANT: current Trakt exports use watched-movies.json (no numeric suffix),
+    # while some older exports used watched-movies-1.json. Support both.
+    movie_summary = _matching_json_rows(files, r"watched-movies(?:-\d+)?\.json")
+    history_rows = _matching_json_rows(files, r"watched-history-\d+\.json")
+    cache: dict[tuple[str, str, str, str], tuple[str | None, dict[str, Any] | None]] = {}
+    resolved_parent_ids = 0
+    unresolved_fallback: list[dict[str, Any]] = []
+
+    watched_map: dict[str, dict[str, Any]] = {}
+
+    def add_movie(entry: dict[str, Any], when_value: Any) -> None:
+        nonlocal resolved_parent_ids
+        movie = entry.get("movie")
+        if not isinstance(movie, dict):
+            return
+        cid, _meta, resolved = _resolve_media_content_id(movie, "movie", bases, timeout, cache)
+        if not cid:
+            return
+        if resolved:
+            resolved_parent_ids += 1
+        if not str(cid).startswith("tt"):
+            unresolved_fallback.append({"type": "movie", "title": movie.get("title"), "content_id": cid})
+        item = {
+            "content_id": cid,
+            "content_type": "movie",
+            "title": movie.get("title") or cid,
+            "season": None,
+            "episode": None,
+            "watched_at": parse_iso_ms(when_value),
+            "_parent_name": movie.get("title"),
+            "_year": movie.get("year"),
+            "_aliases": stable_aliases(movie.get("ids") if isinstance(movie.get("ids"), dict) else {}),
+        }
+        key = watched_item_key(item)
+        watched_map[key] = _latest(watched_map.get(key), item, "watched_at")
+
+    for entry in movie_summary:
+        add_movie(entry, entry.get("last_watched_at") or entry.get("last_updated_at"))
+
+    # Movie history is also used as a fallback. This is what protects us if Trakt changes
+    # the summary filename again or an export omits watched-movies.json entirely.
+    for entry in history_rows:
+        if str(entry.get("type") or "").lower() == "movie":
+            add_movie(entry, entry.get("watched_at"))
+
+    for entry in history_rows:
+        if str(entry.get("type") or "").lower() != "episode":
+            continue
+        show = entry.get("show")
+        ep = entry.get("episode")
+        if not isinstance(show, dict) or not isinstance(ep, dict):
+            continue
+        try:
+            season = int(ep.get("season"))
+            episode = int(ep.get("number"))
+        except (TypeError, ValueError):
+            continue
+        cid, _meta, resolved = _resolve_media_content_id(show, "series", bases, timeout, cache)
+        if not cid:
+            continue
+        if resolved:
+            resolved_parent_ids += 1
+        if not str(cid).startswith("tt"):
+            unresolved_fallback.append({
+                "type": "series",
+                "title": show.get("title"),
+                "year": show.get("year"),
+                "content_id": cid,
+                "season": season,
+                "episode": episode,
+            })
+        episode_title = ep.get("title")
+        title = episode_title or f"{show.get('title') or cid} S{season:02d}E{episode:02d}"
+        item = {
+            "content_id": cid,
+            "content_type": "series",
+            "title": title,
+            "season": season,
+            "episode": episode,
+            "watched_at": parse_iso_ms(entry.get("watched_at")),
+            "_parent_name": show.get("title"),
+            "_year": show.get("year"),
+            "_aliases": stable_aliases(show.get("ids") if isinstance(show.get("ids"), dict) else {}),
+        }
+        key = watched_item_key(item)
+        watched_map[key] = _latest(watched_map.get(key), item, "watched_at")
+
+    movie_states = sum(1 for x in watched_map.values() if x.get("content_type") == "movie")
+    episode_states = sum(1 for x in watched_map.values() if x.get("content_type") == "series" and x.get("season") is not None)
+    warnings: list[str] = []
+
+    # These are strong corruption guards. The old web importer failed here silently because
+    # its test fixture used watched-movies-1.json while this real export uses watched-movies.json.
+    if expected_movies is not None and movie_states != expected_movies:
+        raise ToolError(
+            f"History sanity check failed: Trakt user-stats says {expected_movies} watched movies, "
+            f"but the parser found {movie_states}. No Nuvio changes will be made."
+        )
+    if expected_episodes is not None and episode_states != expected_episodes:
+        raise ToolError(
+            f"History sanity check failed: Trakt user-stats says {expected_episodes} watched episodes, "
+            f"but the parser found {episode_states}. No Nuvio changes will be made."
+        )
+
+    total_history_rows = len(history_rows)
+    expected_plays = movie_plays + episode_plays
+    if expected_plays and total_history_rows != expected_plays:
+        warnings.append(
+            f"Trakt stats report {expected_plays} plays but watched-history files contain {total_history_rows} rows. "
+            "Watched state is still based on the newest row per movie/episode."
+        )
+
+    progress_map: dict[str, dict[str, Any]] = {}
+    unresolved_progress: list[dict[str, Any]] = []
+    if include_progress:
+        for entry in _json_list(files, "watched-playback.json"):
+            typ = str(entry.get("type") or "").lower()
+            media = entry.get("movie") if typ == "movie" else entry.get("show") if typ == "episode" else None
+            if not isinstance(media, dict):
+                continue
+            content_type = "movie" if typ == "movie" else "series"
+            cid, meta, resolved = _resolve_media_content_id(media, content_type, bases, timeout, cache, need_meta=True)
+            if not cid:
+                continue
+            if resolved:
+                resolved_parent_ids += 1
+            try:
+                percent = float(entry.get("progress"))
+            except (TypeError, ValueError):
+                continue
+            if not (0 < percent < 100):
+                continue
+            season = episode = None
+            if typ == "episode":
+                ep = entry.get("episode")
+                if not isinstance(ep, dict):
+                    continue
+                try:
+                    season = int(ep.get("season"))
+                    episode = int(ep.get("number"))
+                except (TypeError, ValueError):
+                    continue
+            minutes = _runtime_minutes_from_meta(meta, season, episode)
+            if not minutes:
+                unresolved_progress.append({
+                    "title": media.get("title"),
+                    "content_id": cid,
+                    "season": season,
+                    "episode": episode,
+                    "progress_percent": percent,
+                    "reason": "Could not resolve runtime from Cinemeta",
+                })
+                continue
+            duration = max(1, int(round(minutes * 60_000)))
+            position = max(1, min(duration - 1, int(round(duration * percent / 100.0))))
+            video_id = f"{cid}:{season}:{episode}" if season is not None and episode is not None else cid
+            progress_key = f"{cid}_s{season}e{episode}" if season is not None and episode is not None else cid
+            item = {
+                "content_id": cid,
+                "content_type": content_type,
+                "video_id": video_id,
+                "season": season,
+                "episode": episode,
+                "position": position,
+                "duration": duration,
+                "last_watched": parse_iso_ms(entry.get("paused_at")),
+                "progress_key": progress_key,
+                "_progress_percent": percent,
+                "_parent_name": media.get("title"),
+                "_year": media.get("year"),
+                "_aliases": stable_aliases(media.get("ids") if isinstance(media.get("ids"), dict) else {}),
+            }
+            key = progress_item_key(item)
+            progress_map[key] = _latest(progress_map.get(key), item, "last_watched")
+
+    # De-duplicate the warning list (e.g. all episodes of one TMDB-only show).
+    seen_fallback: set[tuple[Any, ...]] = set()
+    fallback_unique: list[dict[str, Any]] = []
+    for row in unresolved_fallback:
+        sig = (row.get("type"), row.get("title"), row.get("content_id"))
+        if sig not in seen_fallback:
+            seen_fallback.add(sig)
+            fallback_unique.append(row)
+    if fallback_unique:
+        warnings.append(
+            f"{len(fallback_unique)} title(s) could not be normalized to IMDb IDs. They will use TMDB/Trakt IDs, "
+            "which may not match the ID used by a Nuvio metadata addon."
+        )
+
+    return HistoryPlan(
+        watched_items=sorted(watched_map.values(), key=lambda x: int(x.get("watched_at") or 0), reverse=True),
+        progress_items=sorted(progress_map.values(), key=lambda x: int(x.get("last_watched") or 0), reverse=True),
+        movie_states=movie_states,
+        episode_states=episode_states,
+        movie_plays=movie_plays,
+        episode_plays=episode_plays,
+        source_history_rows=total_history_rows,
+        stats_expected_movies=expected_movies,
+        stats_expected_episodes=expected_episodes,
+        resolved_parent_ids=resolved_parent_ids,
+        unresolved_fallback_ids=fallback_unique,
+        unresolved_progress=unresolved_progress,
+        warnings=warnings,
+    )
+
+
+def history_preview(plan: HistoryPlan) -> dict[str, Any]:
+    return {
+        "movie_watched_states": plan.movie_states,
+        "episode_watched_states": plan.episode_states,
+        "movie_plays_in_trakt": plan.movie_plays,
+        "episode_plays_in_trakt": plan.episode_plays,
+        "history_rows_in_export": plan.source_history_rows,
+        "nuvio_watched_states": len(plan.watched_items),
+        "continue_watching_items": len(plan.progress_items),
+        "resolved_fallback_parent_ids_to_imdb": plan.resolved_parent_ids,
+        "unresolved_fallback_ids": plan.unresolved_fallback_ids,
+        "unresolved_progress": plan.unresolved_progress,
+        "warnings": plan.warnings,
+        "watched_items": [_strip_private(x) for x in plan.watched_items],
+        "progress_items": [_strip_private(x) for x in plan.progress_items],
+    }
+
+
+def _chunk(items: list[Any], size: int) -> Iterable[list[Any]]:
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def _library_key_set(items: list[dict[str, Any]]) -> set[str]:
+    return {
+        f"{str(x.get('content_type') or '').lower()}|{str(x.get('content_id') or '')}"
+        for x in items if isinstance(x, dict) and x.get("content_id")
+    }
+
+
+def _tracking_backup_payload(profile_id: int, library: list[dict[str, Any]], watched: list[dict[str, Any]], progress: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "profile_id": profile_id,
+        "library_count": len(library),
+        "watched_count": len(watched),
+        "progress_count": len(progress),
+        "library": library,
+        "watched_items": watched,
+        "watch_progress": progress,
+    }
+
+
+def replace_tracking_from_plan(
+    api: "NuvioAPI",
+    profile_id: int,
+    plan: HistoryPlan,
+    library_before: list[dict[str, Any]],
+    backup_dir: Path,
+    stamp: str,
+    yes: bool,
+) -> tuple[Path, dict[str, Any]]:
+    """Destructively replace watched/progress only. The Library endpoint is never called here."""
+    watched_before = api.pull_watched(profile_id)
+    progress_before = api.pull_progress(profile_id, limit=10_000)
+    backup_path = backup_dir / f"nuvio-tracking-backup-profile-{profile_id}-{stamp}.json"
+    write_json(backup_path, _tracking_backup_payload(profile_id, library_before, watched_before, progress_before))
+
+    print("\nTracking replacement summary:")
+    print(f"  Existing Nuvio watched states: {len(watched_before)}")
+    print(f"  Trakt watched states to write: {len(plan.watched_items)} ({plan.movie_states} movies + {plan.episode_states} episodes)")
+    print(f"  Existing Continue Watching:    {len(progress_before)}")
+    print(f"  Trakt Continue Watching:       {len(plan.progress_items)}")
+    print(f"  Library items preserved:       {len(library_before)}")
+    print(f"  Tracking backup:               {backup_path}")
+
+    if plan.unresolved_progress:
+        raise ToolError(
+            f"{len(plan.unresolved_progress)} Trakt Continue Watching item(s) have unresolved runtimes. "
+            "Refusing to delete current tracking data until every playback row can be rebuilt. "
+            f"See the preview/backup details."
+        )
+
+    if not yes:
+        print("\nThis will DELETE all Nuvio watched-status and Continue Watching rows for this profile, then rebuild them from Trakt.")
+        print("It does NOT delete or replace your Nuvio Library.")
+        confirm = input("Type REPLACE HISTORY to continue: ").strip()
+        if confirm != "REPLACE HISTORY":
+            raise ToolError("History replacement cancelled before any tracking data was deleted.")
+
+    origin = f"trakt-import-{uuid.uuid4()}"
+    print("Clearing Nuvio watched status and Continue Watching…")
+    if watched_before:
+        keys = [
+            {
+                "content_id": str(x.get("content_id") or ""),
+                **({"season": int(x["season"])} if x.get("season") is not None else {}),
+                **({"episode": int(x["episode"])} if x.get("episode") is not None else {}),
+            }
+            for x in watched_before if x.get("content_id")
+        ]
+        for batch in _chunk(keys, 300):
+            api.delete_watched(profile_id, batch, origin)
+    if progress_before:
+        keys = [progress_item_key(x) for x in progress_before if progress_item_key(x)]
+        for batch in _chunk(keys, 300):
+            api.delete_progress(profile_id, batch, origin)
+
+    # Nuvio Sync can be briefly eventually-consistent. Re-read and delete any stragglers.
+    remaining_watched: list[dict[str, Any]] = []
+    remaining_progress: list[dict[str, Any]] = []
+    for delay in (0.5, 1.2, 2.5, 5.0):
+        time.sleep(delay)
+        remaining_watched = api.pull_watched(profile_id)
+        remaining_progress = api.pull_progress(profile_id, limit=10_000)
+        if not remaining_watched and not remaining_progress:
+            break
+        if remaining_watched:
+            retry_keys = [
+                {
+                    "content_id": str(x.get("content_id") or ""),
+                    **({"season": int(x["season"])} if x.get("season") is not None else {}),
+                    **({"episode": int(x["episode"])} if x.get("episode") is not None else {}),
+                }
+                for x in remaining_watched if x.get("content_id")
+            ]
+            for batch in _chunk(retry_keys, 300):
+                api.delete_watched(profile_id, batch, origin)
+        if remaining_progress:
+            retry_keys = [progress_item_key(x) for x in remaining_progress if progress_item_key(x)]
+            for batch in _chunk(retry_keys, 300):
+                api.delete_progress(profile_id, batch, origin)
+
+    if remaining_watched or remaining_progress:
+        raise ToolError(
+            "Nuvio did not become empty after repeated tracking-delete verification. "
+            f"Stopped before importing new history. Backup: {backup_path}"
+        )
+
+    print("Tracking clear verified. Rebuilding from Trakt…")
+    watched_clean = [_strip_private(x) for x in plan.watched_items]
+    progress_clean = [_strip_private(x) for x in plan.progress_items]
+    for batch in _chunk(watched_clean, 300):
+        api.push_watched(profile_id, batch, origin)
+    for batch in _chunk(progress_clean, 200):
+        api.push_progress(profile_id, batch, origin)
+
+    expected_watched = {watched_item_key(x) for x in watched_clean}
+    expected_progress = {progress_item_key(x) for x in progress_clean}
+    watched_after: list[dict[str, Any]] = []
+    progress_after: list[dict[str, Any]] = []
+    missing_watched: set[str] = set()
+    missing_progress: set[str] = set()
+    for delay in (0.5, 1.2, 2.5, 5.0):
+        time.sleep(delay)
+        watched_after = api.pull_watched(profile_id)
+        progress_after = api.pull_progress(profile_id, limit=max(10_000, len(expected_progress) + 500))
+        actual_watched = {watched_item_key(x) for x in watched_after}
+        actual_progress = {progress_item_key(x) for x in progress_after}
+        missing_watched = expected_watched - actual_watched
+        missing_progress = expected_progress - actual_progress
+        if not missing_watched and not missing_progress:
+            break
+
+    library_after = api.pull_library(profile_id)
+    library_before_keys = _library_key_set(library_before)
+    library_after_keys = _library_key_set(library_after)
+    library_changed = library_before_keys != library_after_keys
+
+    report = {
+        "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "profile_id": profile_id,
+        "backup_file": str(backup_path),
+        "watched_before": len(watched_before),
+        "watched_expected": len(expected_watched),
+        "watched_after": len(watched_after),
+        "missing_watched_keys": sorted(missing_watched),
+        "progress_before": len(progress_before),
+        "progress_expected": len(expected_progress),
+        "progress_after": len(progress_after),
+        "missing_progress_keys": sorted(missing_progress),
+        "library_before": len(library_before),
+        "library_after": len(library_after),
+        "library_key_set_changed": library_changed,
+    }
+    if missing_watched or missing_progress:
+        raise ToolError(
+            f"History was written but verification is missing {len(missing_watched)} watched row(s) and "
+            f"{len(missing_progress)} progress row(s). Backup: {backup_path}"
+        )
+    if library_changed:
+        raise ToolError(
+            "Tracking import verified, but the Nuvio Library key set changed while the operation was running. "
+            "The script never called the Library write endpoint during history replacement, so do not auto-restore; "
+            f"inspect concurrent device changes and the backup at {backup_path}."
+        )
+    print(f"Verified {len(expected_watched)} watched states and {len(expected_progress)} Continue Watching item(s).")
+    print(f"Verified Library membership stayed unchanged at {len(library_after)} item(s).")
+    return backup_path, report
+
 
 class NuvioAPI:
     def __init__(self, base_url: str, publishable_key: str, access_token: str | None = None, timeout: int = 30):
@@ -685,6 +1260,65 @@ class NuvioAPI:
 
     def push_library(self, profile_id: int, items: list[dict[str, Any]]) -> Any:
         return self.rpc("sync_push_library", {"p_profile_id": profile_id, "p_items": items})
+
+    @staticmethod
+    def _list_result(result: Any, *wrapper_keys: str) -> list[dict[str, Any]]:
+        if result is None:
+            return []
+        if isinstance(result, list):
+            return [x for x in result if isinstance(x, dict)]
+        if isinstance(result, dict):
+            for key in wrapper_keys:
+                value = result.get(key)
+                if isinstance(value, list):
+                    return [x for x in value if isinstance(x, dict)]
+        raise ToolError("Nuvio returned an unexpected tracking response.")
+
+    def pull_watched(self, profile_id: int, page_size: int = 900) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            result = self.rpc(
+                "sync_pull_watched_items",
+                {"p_profile_id": profile_id, "p_page": page, "p_page_size": page_size},
+            )
+            batch = self._list_result(result, "items", "data", "watched_items")
+            out.extend(batch)
+            if len(batch) < page_size:
+                break
+            page += 1
+        return out
+
+    def pull_progress(self, profile_id: int, limit: int = 10_000) -> list[dict[str, Any]]:
+        result = self.rpc(
+            "sync_pull_watch_progress",
+            {"p_profile_id": profile_id, "p_limit": int(limit)},
+        )
+        return self._list_result(result, "items", "data", "progress")
+
+    def push_watched(self, profile_id: int, items: list[dict[str, Any]], origin_client_id: str) -> Any:
+        return self.rpc(
+            "sync_push_watched_items",
+            {"p_profile_id": profile_id, "p_items": items, "p_origin_client_id": origin_client_id},
+        )
+
+    def delete_watched(self, profile_id: int, keys: list[dict[str, Any]], origin_client_id: str) -> Any:
+        return self.rpc(
+            "sync_delete_watched_items",
+            {"p_profile_id": profile_id, "p_keys": keys, "p_origin_client_id": origin_client_id},
+        )
+
+    def push_progress(self, profile_id: int, entries: list[dict[str, Any]], origin_client_id: str) -> Any:
+        return self.rpc(
+            "sync_push_watch_progress",
+            {"p_profile_id": profile_id, "p_entries": entries, "p_origin_client_id": origin_client_id},
+        )
+
+    def delete_progress(self, profile_id: int, keys: list[str], origin_client_id: str) -> Any:
+        return self.rpc(
+            "sync_delete_watch_progress",
+            {"p_profile_id": profile_id, "p_keys": keys, "p_origin_client_id": origin_client_id},
+        )
 
 
 def profile_identifier(profile: dict[str, Any]) -> int | None:
@@ -874,23 +1508,37 @@ def validate_metadata_base_url(url: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Import selected personal Trakt lists from a Trakt export ZIP into a Nuvio library.",
+        description=(
+            "Import Trakt personal lists into the Nuvio Library and, optionally, replace Nuvio watched/Continue-Watching "
+            "state from the same Trakt export. Library and tracking data are handled independently."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("export_zip", type=Path, help="Trakt account export ZIP")
     sel = p.add_mutually_exclusive_group()
     sel.add_argument("--all", action="store_true", help="Import all personal lists without asking")
     sel.add_argument("--list", action="append", default=[], metavar="NAME_OR_ID", help="Import a named list; repeat as needed")
-    p.add_argument("--episodes", choices=("parent-series", "skip"), default="parent-series", help="How to handle episode/season list entries")
-    p.add_argument("--dry-run", action="store_true", help="Build an enriched preview, but do not log in to or modify Nuvio")
-    p.add_argument("--preview-file", type=Path, help="Where to write the local mapping preview JSON")
-    p.add_argument("--no-enrich", action="store_true", help="Skip Cinemeta artwork/details lookup (fully offline mapping)")
+    p.add_argument("--episodes", choices=("parent-series", "skip"), default="parent-series", help="How to handle episode/season entries inside personal lists")
+    p.add_argument(
+        "--replace-history",
+        action="store_true",
+        help="Also delete Nuvio watched status + Continue Watching for the selected profile and rebuild them from Trakt (Library is preserved)",
+    )
+    p.add_argument(
+        "--history-only",
+        action="store_true",
+        help="Skip personal-list Library import and only replace watched status + Continue Watching from Trakt",
+    )
+    p.add_argument("--skip-progress", action="store_true", help="When replacing history, do not import Trakt Continue Watching/playback rows")
+    p.add_argument("--dry-run", action="store_true", help="Build previews only; do not log in to or modify Nuvio")
+    p.add_argument("--preview-file", type=Path, help="Where to write the combined local preview JSON")
+    p.add_argument("--no-enrich", action="store_true", help="Skip Cinemeta artwork/details lookup for Library items")
     p.add_argument("--cinemeta-base", action="append", default=[], metavar="URL", help="Override Cinemeta base URL; repeat for fallbacks")
-    p.add_argument("--metadata-workers", type=int, default=8, help="Concurrent Cinemeta metadata requests")
-    p.add_argument("--backup-dir", type=Path, default=Path.cwd(), help="Directory for Nuvio pre-import backup/report files")
+    p.add_argument("--metadata-workers", type=int, default=8, help="Concurrent Cinemeta metadata requests for Library enrichment")
+    p.add_argument("--backup-dir", type=Path, default=Path.cwd(), help="Directory for Nuvio backups/reports")
     p.add_argument("--email", help="Nuvio account email (otherwise NUVIO_EMAIL or an interactive prompt)")
     p.add_argument("--profile", type=int, help="Nuvio profile ID/index (otherwise choose interactively)")
-    p.add_argument("--yes", action="store_true", help="Skip the final IMPORT confirmation")
+    p.add_argument("--yes", action="store_true", help="Skip typed confirmations (use only after reviewing the dry run)")
     p.add_argument("--base-url", default=os.environ.get("NUVIO_BASE_URL", DEFAULT_NUVIO_BASE), help="Nuvio API base URL")
     p.add_argument("--publishable-key", default=os.environ.get("NUVIO_PUBLISHABLE_KEY", DEFAULT_NUVIO_PUBLISHABLE_KEY), help="Nuvio public/publishable API key")
     p.add_argument("--access-token", default=os.environ.get("NUVIO_ACCESS_TOKEN"), help=argparse.SUPPRESS)
@@ -900,54 +1548,105 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     validate_base_url(args.base_url)
-    all_lists = discover_export_lists(args.export_zip)
-    selected = select_lists(all_lists, args.list, args.all)
-    mapping = map_selected_lists(selected, args.episodes)
+    do_history = bool(args.replace_history or args.history_only)
+    do_library = not args.history_only
 
-    print("\nSelected Trakt lists:")
-    for item in selected:
-        counts = ", ".join(f"{v} {k}" for k, v in sorted(type_counts(item.entries).items()))
-        print(f"  • {item.name}: {item.item_count} entries ({counts})")
-    print(f"\nMapped to {len(mapping.items)} unique Nuvio movie/series candidates.")
-    if mapping.episode_entries:
-        if args.episodes == "parent-series":
-            print(
-                f"  {mapping.episode_entries} episode entries map to "
-                f"{mapping.episode_parent_series} distinct parent series."
-            )
-        else:
-            print(f"  {mapping.episode_entries} episode entries are skipped.")
-    if mapping.skipped:
-        print(f"  {len(mapping.skipped)} unsupported/unmappable entries will be skipped.")
+    bases = args.cinemeta_base or list(CINEMETA_BASES)
+    for base in bases:
+        validate_metadata_base_url(base)
 
+    selected: list[ExportList] = []
+    mapping: MappingResult | None = None
     enrichment: EnrichmentResult | None = None
-    import_items = mapping.items
-    if not args.no_enrich:
-        bases = args.cinemeta_base or list(CINEMETA_BASES)
-        for base in bases:
-            validate_metadata_base_url(base)
-        enrichment = enrich_items(import_items, bases, workers=args.metadata_workers)
-        import_items = enrichment.items
-        print(
-            f"Metadata enrichment: {enrichment.enriched}/{len(import_items)} title(s) received details; "
-            f"{enrichment.resolved_ids} fallback ID(s) resolved to IMDb."
-        )
-        if enrichment.failed:
-            print(f"  Warning: metadata was not found for {len(enrichment.failed)} title(s); those remain sparse.")
-        if import_items and enrichment.enriched == 0:
-            raise ToolError(
-                "Cinemeta returned no metadata for any title. No Nuvio write will be attempted. "
-                "Check your internet connection or use --no-enrich if sparse entries are intentional."
+    import_items: list[dict[str, Any]] = []
+
+    if do_library:
+        all_lists = discover_export_lists(args.export_zip)
+        selected = select_lists(all_lists, args.list, args.all)
+        mapping = map_selected_lists(selected, args.episodes)
+
+        print("\nSelected Trakt lists:")
+        for item in selected:
+            counts = ", ".join(f"{v} {k}" for k, v in sorted(type_counts(item.entries).items()))
+            print(f"  • {item.name}: {item.item_count} entries ({counts})")
+        print(f"\nMapped to {len(mapping.items)} unique Nuvio movie/series candidates.")
+        if mapping.episode_entries:
+            if args.episodes == "parent-series":
+                print(
+                    f"  {mapping.episode_entries} episode entries map to "
+                    f"{mapping.episode_parent_series} distinct parent series."
+                )
+            else:
+                print(f"  {mapping.episode_entries} episode entries are skipped.")
+        if mapping.skipped:
+            print(f"  {len(mapping.skipped)} unsupported/unmappable list entries will be skipped.")
+
+        import_items = mapping.items
+        if not args.no_enrich:
+            enrichment = enrich_items(import_items, bases, workers=args.metadata_workers)
+            import_items = enrichment.items
+            print(
+                f"Metadata enrichment: {enrichment.enriched}/{len(import_items)} title(s) received details; "
+                f"{enrichment.resolved_ids} fallback ID(s) resolved to IMDb."
             )
+            if enrichment.failed:
+                print(f"  Warning: metadata was not found for {len(enrichment.failed)} title(s); those remain sparse.")
+            if import_items and enrichment.enriched == 0:
+                raise ToolError(
+                    "Cinemeta returned no metadata for any Library title. No Nuvio write will be attempted. "
+                    "Check your internet connection or use --no-enrich if sparse entries are intentional."
+                )
+
+    history_plan: HistoryPlan | None = None
+    if do_history:
+        print("\nReading Trakt watched history…")
+        history_plan = build_history_plan(
+            args.export_zip,
+            bases,
+            include_progress=not args.skip_progress,
+        )
+        print(
+            f"History parser found {history_plan.movie_states} watched movies + "
+            f"{history_plan.episode_states} watched episodes = {len(history_plan.watched_items)} unique Nuvio watched states."
+        )
+        print(
+            f"Trakt contains {history_plan.movie_plays + history_plan.episode_plays} total play events; "
+            "Nuvio stores one latest watched state per movie/episode, so rewatches are intentionally collapsed."
+        )
+        print(f"Continue Watching rows ready: {len(history_plan.progress_items)}")
+        if history_plan.resolved_parent_ids:
+            print(f"Resolved {history_plan.resolved_parent_ids} fallback TMDB/Trakt parent ID occurrence(s) to IMDb.")
+        for warning in history_plan.warnings:
+            print(f"  Warning: {warning}")
+        if history_plan.unresolved_progress and not args.skip_progress:
+            print(f"  BLOCKER: {len(history_plan.unresolved_progress)} Continue Watching row(s) are missing runtime metadata.")
 
     stamp = safe_timestamp()
     preview_path = args.preview_file or args.backup_dir / f"trakt-to-nuvio-preview-{stamp}.json"
-    write_json(preview_path, make_preview(selected, mapping, enrichment))
+    preview: dict[str, Any] = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "mode": {
+            "library": do_library,
+            "replace_history": do_history,
+            "include_progress": do_history and not args.skip_progress,
+        },
+    }
+    if do_library and mapping is not None:
+        preview["library"] = make_preview(selected, mapping, enrichment)
+    if history_plan is not None:
+        preview["history"] = history_preview(history_plan)
+    write_json(preview_path, preview)
     print(f"Preview: {preview_path}")
 
     if args.dry_run:
         print("Dry run complete. Nuvio was not contacted and nothing was changed.")
         return 0
+
+    if history_plan is not None and history_plan.unresolved_progress and not args.skip_progress:
+        raise ToolError(
+            "History replacement is blocked because some Trakt playback rows cannot be rebuilt exactly. "
+            "Run the dry run and inspect unresolved_progress, or use --skip-progress if you intentionally want to omit Continue Watching."
+        )
 
     api = NuvioAPI(args.base_url, args.publishable_key, access_token=args.access_token)
     if not api.access_token:
@@ -960,92 +1659,110 @@ def main() -> int:
         print("Logging in to Nuvio…")
         api.login(email, password)
 
-    print("Reading Nuvio profiles and current library…")
+    print("Reading Nuvio profiles and current Library…")
     profiles = api.pull_profiles()
     profile_id = choose_profile(profiles, args.profile)
-    existing_raw = api.pull_library(profile_id)
-    merged, added, updated, unchanged, malformed = merge_library(existing_raw, import_items)
+    library_current = api.pull_library(profile_id)
 
-    backup_path = args.backup_dir / f"nuvio-library-backup-profile-{profile_id}-{stamp}.json"
-    write_json(
-        backup_path,
-        {
-            "created_at_utc": datetime.now(timezone.utc).isoformat(),
-            "profile_id": profile_id,
-            "item_count": len(existing_raw),
-            "items": existing_raw,
-        },
-    )
-    print(f"Backup:  {backup_path}")
-
-    print("\nMerge summary:")
-    print(f"  Current Nuvio library: {len(existing_raw)} items")
-    print(f"  Trakt candidates:      {len(import_items)} unique titles")
-    print(f"  Existing enriched:     {updated}")
-    print(f"  Existing unchanged:    {unchanged}")
-    print(f"  New titles to add:     {added}")
-    print(f"  Final library:         {len(merged)} items")
-    if malformed:
-        print(f"  Warning: {len(malformed)} malformed existing item(s) could not be preserved.")
-        print("  Import is blocked so the full-replace operation cannot silently drop them.")
-        raise ToolError("Existing Nuvio library contained unrecognized entries; no write was performed.")
-
-    if added == 0 and updated == 0:
-        print("Nothing to add or repair. Nuvio was not changed.")
-        return 0
-
-    if not args.yes:
-        print(
-            "\nNuvio's library sync is a FULL REPLACE. This tool will push the merged "
-            "library shown above; the backup has already been saved."
-        )
-        confirm = input("Type IMPORT to continue: ").strip()
-        if confirm != "IMPORT":
-            print("Cancelled. Nuvio was not changed.")
-            return 0
-
-    print("Pushing merged library to Nuvio…")
-    api.push_library(profile_id, merged)
-
-    print("Verifying imported IDs…")
-    after = api.pull_library(profile_id)
-    after_ids = {
-        str(x.get("content_id"))
-        for x in after
-        if isinstance(x, dict) and x.get("content_id") is not None
+    combined_report: dict[str, Any] = {
+        "completed_at_utc": None,
+        "profile_id": profile_id,
+        "preview_file": str(preview_path),
+        "library": None,
+        "history": None,
     }
-    expected_ids = {str(x.get("content_id")) for x in import_items if x.get("content_id")}
-    missing = sorted(expected_ids - after_ids)
 
-    report_path = args.backup_dir / f"trakt-to-nuvio-import-report-profile-{profile_id}-{stamp}.json"
-    write_json(
-        report_path,
-        {
-            "completed_at_utc": datetime.now(timezone.utc).isoformat(),
-            "profile_id": profile_id,
-            "selected_lists": [x.name for x in selected],
-            "before_count": len(existing_raw),
+    # Library migration is the same non-destructive merge from the earlier tool.
+    if do_library:
+        library_before_count = len(library_current)
+        merged, added, updated, unchanged, malformed = merge_library(library_current, import_items)
+        library_backup = args.backup_dir / f"nuvio-library-backup-profile-{profile_id}-{stamp}.json"
+        write_json(
+            library_backup,
+            {
+                "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                "profile_id": profile_id,
+                "item_count": len(library_current),
+                "items": library_current,
+            },
+        )
+        print(f"Library backup: {library_backup}")
+        print("\nLibrary merge summary:")
+        print(f"  Current Nuvio Library: {len(library_current)} items")
+        print(f"  Trakt list candidates: {len(import_items)} unique titles")
+        print(f"  Existing enriched:     {updated}")
+        print(f"  Existing unchanged:    {unchanged}")
+        print(f"  New titles to add:     {added}")
+        print(f"  Final Library:         {len(merged)} items")
+        if malformed:
+            raise ToolError(
+                f"Existing Nuvio Library contained {len(malformed)} unrecognized item(s). "
+                "Library write blocked so nothing can be silently dropped."
+            )
+
+        library_missing: list[str] = []
+        if added or updated:
+            if not args.yes:
+                print("\nLibrary sync is a FULL REPLACE, but this tool pushes the already-merged Library and has saved a backup.")
+                confirm = input("Type IMPORT LIBRARY to continue: ").strip()
+                if confirm != "IMPORT LIBRARY":
+                    print("Cancelled before any Nuvio changes.")
+                    return 0
+            print("Pushing merged Library to Nuvio…")
+            api.push_library(profile_id, merged)
+            library_after = api.pull_library(profile_id)
+            after_ids = {str(x.get("content_id")) for x in library_after if x.get("content_id")}
+            expected_ids = {str(x.get("content_id")) for x in import_items if x.get("content_id")}
+            library_missing = sorted(expected_ids - after_ids)
+            if library_missing:
+                raise ToolError(
+                    f"Nuvio accepted the Library write, but {len(library_missing)} imported ID(s) were not found on verification. "
+                    f"Keep the backup at {library_backup}."
+                )
+            library_current = library_after
+            print(f"Verified all {len(expected_ids)} imported/repaired Library IDs.")
+        else:
+            print("Library already contains everything from the selected Trakt lists; no Library write needed.")
+
+        combined_report["library"] = {
+            "backup_file": str(library_backup),
+            "before_count": library_before_count,
+            "after_count": len(library_current),
             "candidate_count": len(import_items),
             "existing_enriched": updated,
             "existing_unchanged": unchanged,
             "added_requested": added,
-            "metadata_enriched": enrichment.enriched if enrichment else 0,
-            "metadata_failures": enrichment.failed if enrichment else [],
-            "after_count": len(after),
-            "missing_after_verification": missing,
-            "backup_file": str(backup_path),
-            "preview_file": str(preview_path),
-        },
-    )
+            "missing_after_verification": library_missing,
+        }
 
-    if missing:
-        raise ToolError(
-            f"Nuvio accepted the write, but {len(missing)} newly-added ID(s) were not found on verification. "
-            f"See {report_path} and keep the backup."
+    if do_history and history_plan is not None:
+        # IMPORTANT: this function never calls sync_push_library. It backs up the current Library
+        # only so we can verify its membership was not touched by the destructive tracking reset.
+        tracking_backup, tracking_report = replace_tracking_from_plan(
+            api=api,
+            profile_id=profile_id,
+            plan=history_plan,
+            library_before=library_current,
+            backup_dir=args.backup_dir,
+            stamp=stamp,
+            yes=args.yes,
         )
+        combined_report["history"] = {
+            **tracking_report,
+            "backup_file": str(tracking_backup),
+            "trakt_movie_plays": history_plan.movie_plays,
+            "trakt_episode_plays": history_plan.episode_plays,
+            "trakt_unique_movie_states": history_plan.movie_states,
+            "trakt_unique_episode_states": history_plan.episode_states,
+            "unresolved_fallback_ids": history_plan.unresolved_fallback_ids,
+        }
 
-    print(f"Done. Verified all {len(expected_ids)} imported/repaired title ID(s) in Nuvio.")
-    print(f"Report:  {report_path}")
+    combined_report["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+    report_path = args.backup_dir / f"trakt-to-nuvio-import-report-profile-{profile_id}-{stamp}.json"
+    write_json(report_path, combined_report)
+    print(f"\nDone. Report: {report_path}")
+    if do_history:
+        print("If the Nuvio app still does not show these watched states, make sure its watched/progress source is set to Nuvio Sync rather than a connected tracking provider.")
     return 0
 
 

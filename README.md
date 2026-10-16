@@ -1,349 +1,478 @@
 > [!WARNING]
 > This project is fully vibecoded, probably inefficient, but it does what I wanted lol
 
-# Trakt Lists → Nuvio Library
+# Trakt → Nuvio Library + History Importer
 
-A dependency-free Python tool that imports **personal/custom Trakt lists from a Trakt account export ZIP into your Nuvio library**.
+A dependency-free Python tool for migrating a **Trakt account export ZIP into Nuvio** while keeping the Nuvio Library and tracking data separate.
 
-It was created for the case where Nuvio can import Trakt watch history, but your Trakt lists do not automatically become Nuvio library entries.
+It can:
 
-The importer reads your Trakt export, maps the selected movies/shows into Nuvio library records, optionally enriches them with Cinemeta metadata, merges them with your existing Nuvio library, creates a backup, and only then writes the merged library back to Nuvio.
+- import Trakt personal/custom lists into the existing Nuvio Library;
+- enrich sparse list entries with Cinemeta artwork/details;
+- repair an earlier incomplete watched-history import;
+- replace only Nuvio watched status + Continue Watching from Trakt;
+- back up everything it is about to touch;
+- verify writes by reading Nuvio back afterward;
+- refuse destructive tracking resets when the Trakt export does not parse cleanly.
+
+The history replacement path was added after finding a real Trakt-export compatibility bug: current exports can use `watched-movies.json`, while an older importer assumed only numbered names such as `watched-movies-1.json`. That caused watched movies to be silently omitted even though episode history imported.
 
 ## Repository files
 
 ```text
-trakt_lists_to_nuvio.py   Main importer
-README.md                  Setup, usage, architecture, and security guide
-.gitignore                 Keeps common exports/backups/previews/secrets out of Git
+trakt_lists_to_nuvio.py              Main importer
+README.md                             Setup, usage, architecture, and safety guide
+tests/test_trakt_lists_to_nuvio.py   Regression tests for history parsing/reset safety
+.gitignore                            Keeps exports/backups/previews out of Git
 ```
 
 There are no required third-party Python packages.
 
 ## Requirements
 
-You need:
-
-- Python 3.10+ recommended
-- A Trakt account export ZIP containing your personal lists
+- Python 3.10+
+- A Trakt account export ZIP
 - A Nuvio account
-- Internet access for a real Nuvio import
-- Internet access to Cinemeta if metadata enrichment is enabled
-
-The script uses only Python's standard library, including `urllib`, `zipfile`, `json`, `getpass`, and `concurrent.futures`.
+- Internet access for Nuvio writes
+- Internet access to Cinemeta for Library enrichment and Continue Watching runtime resolution
 
 Check Python with:
 
 ```bash
-python3 --version
+python --version
 ```
 
 No `pip install` step is required.
 
-## Getting started
+## Recommended workflow
 
-Clone or download this repository, then place your Trakt export somewhere convenient. You do **not** need to extract the Trakt export ZIP yourself.
+If your Nuvio Library is already correct and you only want to repair watched history, use **history-only mode**.
 
-Show the command-line help:
+First preview the Trakt history locally:
 
 ```bash
-python3 trakt_lists_to_nuvio.py --help
+python trakt_lists_to_nuvio.py trakt-export.zip --history-only --dry-run
 ```
 
-For a first run, use a dry run:
+Then perform the tracking replacement:
 
 ```bash
-python3 trakt_lists_to_nuvio.py trakt-export.zip --all --dry-run
+python trakt_lists_to_nuvio.py trakt-export.zip --history-only
 ```
 
-A dry run:
+Before deleting anything, the script:
 
-- reads your Trakt export;
-- maps your selected lists;
-- contacts Cinemeta for metadata unless `--no-enrich` is used;
-- writes a local preview JSON;
-- does **not** log in to Nuvio;
-- does **not** modify your Nuvio library.
+1. reads the selected Nuvio profile;
+2. downloads the current Library, watched rows, and Continue Watching rows;
+3. writes a tracking backup locally;
+4. validates the Trakt watched counts;
+5. requires `REPLACE HISTORY` unless `--yes` was supplied.
 
-For a completely offline parse/mapping test:
+The history replacement code **does not call Nuvio's Library write endpoint**.
+
+## Import Library lists and repair history in one run
+
+To import all personal Trakt lists and then rebuild tracking from the same export:
 
 ```bash
-python3 trakt_lists_to_nuvio.py trakt-export.zip --all --dry-run --no-enrich
+python trakt_lists_to_nuvio.py trakt-export.zip --all --replace-history
 ```
 
-## Performing an import
+This has two independent phases:
 
-Import all personal lists:
-
-```bash
-python3 trakt_lists_to_nuvio.py trakt-export.zip --all
+```text
+Trakt personal lists
+        ↓
+merge into existing Nuvio Library
+        ↓
+verify Library
+        ↓
+backup current tracking
+        ↓
+clear watched + Continue Watching only
+        ↓
+verify tracking is empty
+        ↓
+rebuild tracking from Trakt
+        ↓
+verify watched/progress
+        ↓
+verify Library membership did not change
 ```
 
-Or let the tool ask which lists to use:
+If the Library already contains everything from the selected lists, no Library write occurs.
+
+## Library-only import
+
+The original behavior is still available.
+
+Import every discovered personal list:
 
 ```bash
-python3 trakt_lists_to_nuvio.py trakt-export.zip
+python trakt_lists_to_nuvio.py trakt-export.zip --all
+```
+
+Choose lists interactively:
+
+```bash
+python trakt_lists_to_nuvio.py trakt-export.zip
 ```
 
 Import specific lists by name or Trakt list ID:
 
 ```bash
-python3 trakt_lists_to_nuvio.py trakt-export.zip \
-  --list "Movies to Watch" \
-  --list "Favorites"
+python trakt_lists_to_nuvio.py trakt-export.zip \
+  --list "movies" \
+  --list "shows"
 ```
 
-Unless `--yes` is supplied, the tool shows a merge summary and requires you to type:
+### Episode/season rows inside personal lists
+
+By default, episode and season list rows map to their parent series:
+
+```bash
+python trakt_lists_to_nuvio.py trakt-export.zip --all --episodes parent-series
+```
+
+To skip those rows:
+
+```bash
+python trakt_lists_to_nuvio.py trakt-export.zip --all --episodes skip
+```
+
+## Why history replacement does not duplicate watched entries
+
+Nuvio stores a current watched state for a movie or episode, not every historical replay event.
+
+For a given item, the importer keys state roughly as:
 
 ```text
-IMPORT
+movie:   content_id
+series:  content_id + season + episode
 ```
 
-before it writes anything to Nuvio.
+Trakt may contain multiple watch events for the same item. The importer keeps the newest watched timestamp for each movie/episode.
 
-## Episode and season entries
+When `--replace-history` or `--history-only` is used, it intentionally:
 
-Nuvio's library stores movie/series titles rather than individual Trakt episode-list rows.
+1. backs up Nuvio tracking;
+2. deletes all watched-status rows for the selected profile;
+3. deletes all Continue Watching rows for the selected profile;
+4. repeatedly reads Nuvio until both tracking tables are verified empty;
+5. writes the deduplicated Trakt state;
+6. verifies every expected watched/progress key exists afterward.
 
-By default, episode and season entries are mapped to their parent series:
+Because the old tracking state is cleared first, rerunning the repair does not stack duplicate watched rows.
 
-```bash
-python3 trakt_lists_to_nuvio.py trakt-export.zip --all --episodes parent-series
-```
+## The `watched-movies.json` bug that this fixes
 
-To ignore episode/season entries instead:
-
-```bash
-python3 trakt_lists_to_nuvio.py trakt-export.zip --all --episodes skip
-```
-
-## Metadata enrichment
-
-Trakt exports contain useful IDs and title information, but they do not necessarily contain the artwork/details Nuvio normally displays.
-
-By default, the importer uses **Cinemeta** to enrich mapped titles with data such as:
-
-- poster
-- poster shape
-- background
-- title logo when available
-- description
-- release information
-- IMDb rating
-- genres
-
-The importer prefers stable IMDb IDs when possible. If a row initially only has a TMDB or Trakt fallback ID, Cinemeta may allow the tool to resolve it to an IMDb ID.
-
-Disable metadata lookups with:
-
-```bash
-python3 trakt_lists_to_nuvio.py trakt-export.zip --all --no-enrich
-```
-
-If enrichment is enabled and Cinemeta returns no metadata at all for the selected titles, the importer stops before contacting Nuvio rather than unexpectedly writing a completely sparse library import.
-
-## How the import works
-
-At a high level:
+Some Trakt exports use:
 
 ```text
-Trakt export ZIP
-      ↓
-Discover personal/custom lists
-      ↓
-Select one, several, or all lists
-      ↓
-Normalize movie/show IDs
-      ↓
-Optionally enrich through Cinemeta
-      ↓
-Write local preview JSON
-      ↓
-Log in to Nuvio
-      ↓
-Read profiles + current library
-      ↓
-Save pre-import library backup
-      ↓
-Merge selected Trakt titles into current library
-      ↓
-Show summary + ask for confirmation
-      ↓
-Push merged library
-      ↓
-Read library again and verify imported IDs
-      ↓
-Write import report
+watched-movies.json
 ```
 
-### ID mapping
+Older/alternate exports may use:
 
-The script reads Trakt/IMDb/TMDB identifiers from the export. It prefers IMDb IDs such as:
+```text
+watched-movies-1.json
+watched-movies-2.json
+```
+
+The importer supports both with:
+
+```text
+watched-movies(?:-N)?.json
+```
+
+It also reads movie records from `watched-history-N.json` as a fallback. This prevents a filename change from silently dropping all watched movies again.
+
+The regression tests specifically cover the unnumbered `watched-movies.json` case.
+
+## Trakt count sanity checks
+
+Before a destructive history reset, the importer compares the parsed unique watched-state counts against `user-stats.json` when those values are present.
+
+For example, if Trakt says there should be 61 watched movies but the parser only finds 0, the script raises an error **before logging into or deleting tracking data**.
+
+This is intentionally stricter than only verifying the final upload. A write can be perfectly successful while still being incomplete if the parser skipped source records, so source-side validation is required too.
+
+## IDs and Nuvio matching
+
+The importer prefers IMDb IDs such as:
 
 ```text
 tt1234567
 ```
 
-When an IMDb ID is not available, temporary fallback IDs such as `tmdb:...` or `trakt:...` may be used. Enrichment can sometimes resolve those fallback IDs to IMDb IDs before the Nuvio write.
+If IMDb is unavailable it can temporarily use:
 
-### Merge behavior
+```text
+tmdb:12345
+trakt:67890
+```
 
-The tool first downloads your current Nuvio library and merges the selected Trakt titles into it.
+For Library entries, Cinemeta can often resolve fallback IDs to IMDb IDs before the write.
 
-For matching entries it is intentionally conservative:
+For watched TV episodes, the parent show ID matters because Nuvio's watched key includes the parent content ID plus season/episode. If Trakt uses `tmdb:...` while Nuvio metadata uses an IMDb ID, the same episode can otherwise look unwatched in the app even though a server row exists.
 
-- existing nonblank Nuvio metadata is preserved;
-- blank fields can be filled from enriched Trakt/Cinemeta data;
-- old fallback IDs can be upgraded to IMDb IDs when safely resolved;
-- duplicate entries are avoided during ID upgrades;
-- entries previously created by the older importer can be repaired rather than requiring you to delete them first.
+The history parser therefore attempts cross-ID normalization through Cinemeta instead of embedding user/export-specific title mappings in the repository.
 
-If the current Nuvio library contains malformed/unrecognized rows that the script cannot safely preserve, the import is blocked rather than silently dropping them.
+## Continue Watching
 
-## Important: Nuvio library writes are full replacement
+Trakt playback exports store progress as a percentage. Nuvio stores position and duration in milliseconds.
 
-Nuvio's library sync operation used by this tool replaces the library payload with the complete merged library.
+The importer therefore needs runtime metadata to convert:
 
-That is why the importer:
+```text
+Trakt:  25%
+```
 
-1. downloads your current library first;
-2. merges your Trakt entries locally;
-3. saves a backup;
-4. shows the before/after counts;
-5. requires confirmation by default;
-6. verifies the imported IDs after the write.
+into something like:
 
-Do not treat the backup step as optional housekeeping. Keep the backup until you have checked the resulting Nuvio library.
+```text
+Nuvio position:  600000 ms
+Nuvio duration: 2400000 ms
+```
+
+For episodes it uses season/episode-specific runtime metadata when available.
+
+If any Trakt playback row cannot be reconstructed with a runtime, history replacement is blocked rather than clearing good Nuvio progress and silently losing the unresolved rows.
+
+If you intentionally do not care about Continue Watching and only want watched/unwatched state:
+
+```bash
+python trakt_lists_to_nuvio.py trakt-export.zip --history-only --skip-progress
+```
+
+`--no-enrich` disables Library artwork/details lookup only. History-progress runtime lookup is separate because exact runtime is needed to rebuild Continue Watching safely.
+
+## Library merge behavior
+
+The Library portion remains non-destructive at the item level.
+
+The tool:
+
+- reads the existing Nuvio Library first;
+- keeps existing items;
+- avoids duplicates using stable IDs/aliases;
+- preserves existing nonblank metadata;
+- fills blank poster/background/logo/description/rating/genre fields when metadata is available;
+- can normalize an old TMDB/Trakt fallback ID to an IMDb ID when safely resolved;
+- repairs the incorrect `https://trakt.tv` addon URL written by an older version of this importer;
+- blocks the write if existing Nuvio rows cannot be safely represented.
+
+### Important: Nuvio Library sync is a full replacement
+
+The API call used to write Library data takes the complete Library payload. Therefore the script always pulls the current Library, merges locally, saves a backup, and pushes the complete merged result.
+
+Unless `--yes` is supplied, a Library write requires:
+
+```text
+IMPORT LIBRARY
+```
+
+The history replacement is a separate operation and requires:
+
+```text
+REPLACE HISTORY
+```
+
+## Metadata enrichment
+
+Trakt exports often contain IDs/title/year but not the artwork Nuvio expects for a good Library card.
+
+By default, the Library importer uses Cinemeta to fill fields such as:
+
+- poster
+- poster shape
+- background
+- logo when available
+- description
+- release information
+- IMDb rating
+- genres
+
+Disable Library enrichment with:
+
+```bash
+python trakt_lists_to_nuvio.py trakt-export.zip --all --no-enrich
+```
+
+If Library enrichment is enabled and no selected title receives any metadata at all, the script stops before writing Nuvio rather than producing a completely sparse Library import.
 
 ## Backups, previews, and reports
 
-Before a live write, the tool creates a backup similar to:
-
-```text
-nuvio-library-backup-profile-<id>-YYYYMMDD-HHMMSS.json
-```
-
-It also creates a preview before login/write:
+A preview is written before any live Nuvio change:
 
 ```text
 trakt-to-nuvio-preview-YYYYMMDD-HHMMSS.json
 ```
 
-After a successful write it creates an import report containing counts, selected lists, metadata results, verification results, and the backup/preview filenames.
+Before a Library write:
+
+```text
+nuvio-library-backup-profile-<id>-YYYYMMDD-HHMMSS.json
+```
+
+Before a tracking reset:
+
+```text
+nuvio-tracking-backup-profile-<id>-YYYYMMDD-HHMMSS.json
+```
+
+The tracking backup contains:
+
+- current Library snapshot;
+- current watched rows;
+- current Continue Watching rows.
+
+After completion:
+
+```text
+trakt-to-nuvio-import-report-profile-<id>-YYYYMMDD-HHMMSS.json
+```
 
 Choose another output directory with:
 
 ```bash
-python3 trakt_lists_to_nuvio.py trakt-export.zip --all --backup-dir ./private-backups
+python trakt_lists_to_nuvio.py trakt-export.zip --history-only --backup-dir ./private-backups
 ```
 
 ## Nuvio login
 
-The script talks directly to Nuvio's API; it does not automate a browser.
+The script talks directly to Nuvio's API. It does not automate a browser.
 
-For a normal login it asks for:
+For normal login it prompts for:
 
-- your Nuvio email;
-- your Nuvio password using hidden terminal input.
+- Nuvio email;
+- Nuvio password using hidden terminal input.
 
-The password is **not saved by the script**.
+The password is not saved by the script.
 
-You can provide the email through an environment variable:
+Supported environment variables include:
 
-```bash
-export NUVIO_EMAIL="you@example.com"
+```text
+NUVIO_EMAIL
+NUVIO_PASSWORD
+NUVIO_BASE_URL
+NUVIO_PUBLISHABLE_KEY
+NUVIO_ACCESS_TOKEN
 ```
 
-The script also supports `NUVIO_PASSWORD`, but an interactive hidden password prompt is safer for ordinary manual use because environment variables can sometimes be exposed to other processes, shell configuration, logs, debugging tools, or automation environments.
+Interactive password entry is preferable for normal manual use because environment variables can be exposed by shell/process/debugging configuration.
 
-The built-in Nuvio key in the script is Nuvio's **public/publishable client key**. It is not your personal password or private access token.
+The built-in Nuvio key is a public/publishable client key, not a user password or private account token.
 
-## Nuvio profiles
+## Multiple Nuvio profiles
 
-If your account has multiple Nuvio profiles, the tool can ask you to choose one interactively.
+If the account has several profiles, the script asks which one to use.
 
-You can also specify one:
+You can also specify one directly:
 
 ```bash
-python3 trakt_lists_to_nuvio.py trakt-export.zip --all --profile 1
+python trakt_lists_to_nuvio.py trakt-export.zip --history-only --profile 1
 ```
 
-## Useful options
+## Main options
 
 ```text
 --all
     Import every discovered personal Trakt list.
 
 --list NAME_OR_ID
-    Select a specific list by name or Trakt ID. Repeat as needed.
+    Select a personal list by name or Trakt ID. Repeat as needed.
 
---episodes parent-series
-    Convert episode/season rows to their parent series. Default.
+--episodes parent-series|skip
+    Control episode/season rows inside personal lists.
 
---episodes skip
-    Skip episode/season rows.
+--replace-history
+    After the Library phase, replace watched status + Continue Watching from Trakt.
+
+--history-only
+    Do not write the Library; only replace watched/progress state.
+
+--skip-progress
+    Replace watched status but do not import Trakt Continue Watching.
 
 --dry-run
-    Create a preview without logging in to or modifying Nuvio.
+    Build previews only; do not log in to or modify Nuvio.
 
 --no-enrich
-    Disable Cinemeta lookups.
+    Disable Library Cinemeta artwork/details enrichment.
 
 --cinemeta-base URL
-    Override the Cinemeta endpoint. Repeat to provide fallbacks.
+    Override Cinemeta endpoint; repeat for fallbacks.
 
 --metadata-workers N
-    Number of concurrent Cinemeta metadata requests.
-
---preview-file FILE
-    Choose the preview JSON filename.
+    Number of concurrent Library metadata requests.
 
 --backup-dir DIR
-    Choose where preview, backup, and report files are written.
+    Directory for previews, backups, and reports.
 
 --email EMAIL
-    Supply the Nuvio email instead of prompting/NUVIO_EMAIL.
+    Supply Nuvio email instead of prompting/NUVIO_EMAIL.
 
---profile PROFILE
-    Choose a Nuvio profile ID/index.
+--profile ID
+    Select the Nuvio profile.
 
 --yes
-    Skip the final IMPORT confirmation.
+    Skip typed confirmations. Use only after reviewing a dry run.
 
 --base-url URL
-    Override the Nuvio API endpoint.
+    Override Nuvio API base URL.
 
 --publishable-key KEY
-    Override the Nuvio public/publishable API key.
+    Override the Nuvio public/publishable key.
+```
+
+Show the complete current help with:
+
+```bash
+python trakt_lists_to_nuvio.py --help
+```
+
+## Testing
+
+Run the regression tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests currently cover:
+
+- current `watched-movies.json` parsing;
+- older numbered `watched-movies-N.json` parsing;
+- movie-history fallback/deduplication;
+- `user-stats.json` mismatch blocking;
+- proof that the destructive tracking-replacement function never writes the Library.
+
+Also run a syntax check after changes:
+
+```bash
+python -m py_compile trakt_lists_to_nuvio.py
 ```
 
 ## Security and privacy
 
-This project handles account credentials and personal media-library data, so treat the working directory and generated files accordingly.
+This project handles credentials and personal viewing data.
 
-- **Trakt exports are personal data.** They can reveal your lists, titles, viewing interests, and account-related identifiers. Do not commit them to Git.
-- **Preview, backup, and report JSON files are personal data.** They can contain your Nuvio library and import details. The included `.gitignore` excludes common generated filenames.
-- **Do not hard-code your Nuvio password or access token into the script.** The normal password prompt uses `getpass` so the password is not echoed.
-- **The bundled publishable key is public client configuration, not a user secret.** Access/session tokens obtained after login are different and should remain private.
-- **Custom API endpoints are restricted for credential safety.** The script requires HTTPS for Nuvio/Cinemeta URLs, except localhost HTTP for local testing.
-- **Be careful with `NUVIO_PASSWORD` and `NUVIO_ACCESS_TOKEN`.** Environment variables are convenient for automation but can be exposed by process/debugging/configuration mistakes.
-- **Use `--yes` carefully.** It removes the final manual `IMPORT` confirmation before a full library replacement.
-- **Keep your backup until verification is complete.** A network/API/service change can always cause unexpected behavior.
-- **Review dry-run results after upstream changes.** Nuvio and Cinemeta are external services; API formats or behavior may change over time.
+- Do not commit Trakt export ZIPs.
+- Do not commit preview/backup/report JSON files.
+- Do not hard-code a Nuvio password or access token.
+- Keep backups until you have verified both nuvio.tv and the Nuvio app.
+- Custom service URLs must use HTTPS, except localhost HTTP for local testing.
+- Be cautious with `NUVIO_PASSWORD` and `NUVIO_ACCESS_TOKEN` environment variables.
+- `--yes` removes the typed safety confirmations and should not be your first run.
+- Close Nuvio on other devices before a destructive history reset to reduce the chance of stale local state racing the migration.
 
-## Example first-time workflow
+The included `.gitignore` excludes the common Trakt export, preview, backup, and report filenames.
 
-```bash
-# 1. Inspect the available options
-python3 trakt_lists_to_nuvio.py --help
+## If nuvio.tv shows watched but the app does not
 
-# 2. Completely offline parse test
-python3 trakt_lists_to_nuvio.py trakt-export.zip --all --dry-run --no-enrich
+Nuvio Mobile can use a connected tracking provider as the active watched/progress source instead of Nuvio Sync.
 
-# 3. Enriched preview; Cinemeta is contacted, Nuvio is not
-python3 trakt_lists_to_nuvio.py trakt-export.zip --all --dry-run
+If the account/server page shows the imported state but the app does not, set the app's watched/progress source to **Nuvio Sync**, then fully close and reopen the app so it refreshes from the server.
 
-# 4. Real import; review the merge summary and type IMPORT
-python3 trakt_lists_to_nuvio.py trakt-export.zip --all
-```
-
-That sequence gives you a chance to inspect the export mapping and metadata before the tool ever writes to Nuvio.
+Also remember that watched matching depends on the content ID. A TMDB-vs-IMDb parent-ID mismatch can make an episode row exist on the server while not matching the metadata ID the app is currently displaying; this importer attempts to normalize those IDs during the Trakt history parse.
