@@ -12,8 +12,8 @@ A dependency-free Python tool for importing Trakt personal lists into Nuvio and 
 Requires **Python 3.10+**, a **Trakt account export ZIP**, a **Nuvio account**, and internet access. No `pip install` step is needed.
 
 ```sh
-git clone https://github.com/RotatingWires/trakt-lists-to-nuvio-library.git
-cd trakt-lists-to-nuvio-library
+git clone https://github.com/RotatingWires/trakt-to-nuvio-sync.git
+cd trakt-to-nuvio-sync
 ```
 
 Put your export ZIP somewhere private. Replace `trakt-export.zip` below with its path.
